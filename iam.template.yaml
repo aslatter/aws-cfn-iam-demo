@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  DeploymentRoleTrustPolicy:
+    Type: String
+Resources:
+  DeploymentRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: Deployment
+      Path: /core/iam/
+      Description: ""
+      AssumeRolePolicyDocument: !Ref DeploymentRoleTrustPolicy
+      MaxSessionDuration: 43200
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2FullAccess"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEventBridgeFullAccess"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonRoute53FullAccess"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSQSFullAccess"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonVPCFullAccess"
+
+  # This policy controls the IAM access we allow our deployment principal.
+  # We have to thread a narrow path - we want to allow our deployment role
+  # to customize least-priviged roles during the deployment process, so it
+  # needs the ability to create roles and assign them bespoke policies.
+  # However allowing free-reign in this area would basically allow the deployment
+  # user to pivot to account-admin pretty easily.
+  # We solve this with permission-boundaries and IAM-resource-paths.
+  # By scoping access to IAM-resources by path, the deployment-role is
+  # unable to edit itself or the policies applied to itself.
+  # We also condition the ability to create roles on attaching a specific
+  # permission-boundary to the role. This prevents the down-stream "child"
+  # roles from having permissions we wish to deny the deployment-role itself.
+  #
+  # These restrictions have two purposes:
+  # - We prevent the creation of IAM principals with long-lived credentials
+  # - We're able to prevent access to high-risk actions from in-cluster principals
+  #   (EKS and ECR non-readonly actions).
+  DeploymentIAMAccess:
+    Type: "AWS::IAM::RolePolicy"
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: "IAMAccess"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        # Allow read-only IAM access
+        - Action:
+          - iam:List*
+          - iam:Get*
+          Effect: Allow
+          Resource: "*"
+        # Allow creating roles, but only within a specified path and
+        # with a specified role-boundary. This prevents the deployment
+        # principal from using IAM access to pivot to account admin.
+        - Action: iam:CreateRole
+          Condition:
+            StringEquals:
+              "iam:PermissionsBoundary": !Ref DeploymentRoleBoundary
+          Effect: Allow
+          Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/deployment/*"
+        # Work with IAM policies (under a specified path)
+        - Action:
+          - iam:UntagPolicy
+          - iam:TagPolicy
+          - iam:SetDefaultPolicyVersion
+          - iam:DeletePolicyVersion
+          - iam:DeletePolicy
+          - iam:CreatePolicyVersion
+          - iam:CreatePolicy
+          Effect: Allow
+          Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:policy/deployment/*"
+        # Allow managing roles (under a specified path)
+        # Note: This includes the "PassRole" permission. Because it's
+        # scoped to this path, we should only be able to pass-roles which
+        # also have the required role-permission-boundary referenced above.
+        - Action:
+          - iam:UpdateRole
+          - iam:UpdateAssumeRolePolicy
+          - iam:UntagRole
+          - iam:TagRole
+          - iam:PutRolePolicy
+          - iam:PassRole
+          - iam:DetachRolePolicy
+          - iam:DeleteRolePolicy
+          - iam:DeleteRole
+          - iam:AttachRolePolicy
+          Effect: Allow
+          Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/deployment/*"
+        # Allow managing instance-profiles. Note that the 'AddRoleToInstanceProfile'
+        # also requires the 'PassRole' permission, so our pass-role condition is
+        # still enforced even though it's not repeated here.
+        - Action:
+          - iam:UntagInstanceProfile
+          - iam:TagInstanceProfile
+          - iam:RemoveRoleFromInstanceProfile
+          - iam:ListInstanceProfileTags
+          - iam:GetInstanceProfile
+          - iam:DeleteInstanceProfile
+          - iam:CreateInstanceProfile
+          - iam:AddRoleToInstanceProfile
+          Effect: Allow
+          Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:instance-profile/deployment/*"
+        # Allow managing OIDC providers, but only for EKS api-server
+        # OIDC issuers.
+        - Action:
+          - iam:UpdateOpenIDConnectProviderThumbprint
+          - iam:UntagOpenIDConnectProvider
+          - iam:TagOpenIDConnectProvider
+          - iam:DeleteOpenIDConnectProvider
+          - iam:CreateOpenIDConnectProvider
+          Effect: Allow
+          Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/oidc.eks.*.amazonaws.com/*"
+
+
+  DeploymentAdditionalPolicies:
+    Type: "AWS::IAM::RolePolicy"
+    Properties:
+      RoleName: !Ref DeploymentRole
+      PolicyName: "AdditionalPolicies"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          # Allow access to EKS and Resource Groups
+          - Action:
+              - resource-groups:*
+              - eks:*
+            Effect: Allow
+            Resource: "*"
+          # Ban the creation of service-linked-roles.
+          # Various managed policies allow this. It might
+          # be fine but I'm suspicious.
+          - Action: iam:CreateServiceLinkedRole
+            Effect: Deny
+            Resource: "*"
+
+  DeploymentRoleBoundary:
+    # Permission boundary used by roles created by the Deployment role
+    Type: "AWS::IAM::ManagedPolicy"
+    Properties:
+      ManagedPolicyName: RoleBoundary
+      Path: /core/iam/deployment/
+      Description: ""
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "ssmmessages:*"
+              - "ssm:*"
+              - "sqs:*"
+              - "s3:*"
+              - "pricing:*"
+              - "kms:*"
+              # why is this here? who in-cluster uses this?
+              - "events:*"
+              - "elasticloadbalancing:*"
+              - "eks-auth:*"
+              - "ec2messages:*"
+              - "ec2:*"
+              - "dynamodb:*"
+              - "autoscaling:*"
+              # Limit EKS and ECR to read-only
+              - "eks:Describe*"
+              - "ecr:List*"
+              - "ecr:Get*"
+              - "ecr:Describe*"
+              - "ecr:BatchGetImage"
+              - "ecr:BatchCheckLayerAvailability"
+            Effect: Allow
+            Resource: "*"
+          # Only allow "passrole" for rows the deployment is allowed to
+          # create/modify.
+          - Action: iam:PassRole
+            Effect: Allow
+            Resource: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/deployment/*"
+          # Ban editing of resource-policies
+          - Action:
+              - sqs:SetQueueAttributes
+              - s3:*BucketPolicy
+              - kms:*KeyPolicy
+              - dynamodb:*ResourcePolicy
+            Effect: Deny
+            Resource: "*"
